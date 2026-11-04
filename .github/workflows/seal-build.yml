@@ -1,0 +1,126 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run instead of the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two Go releases supported when v0.45.0 shipped (2025-10-07); the
+        # http2 suite (transport_test.go etc.) builds only on go1.25 or with
+        # GOEXPERIMENT=synctest.
+        go: ["1.24.7", "1.25.1"]
+    env:
+      MODULE: golang.org/x/net
+      VERSION: v0.45.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Go environment
+        run: go version && go env
+
+      - name: Create module zip
+        run: |
+          set -euo pipefail
+          # Pack a copy of the tree without this CI workflow (upstream ships no .github).
+          rm -rf "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/out"
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/out"
+          cp -a . "$RUNNER_TEMP/modsrc/"
+          rm -rf "$RUNNER_TEMP/modsrc/.git"
+          rm -f "$RUNNER_TEMP/modsrc/.github/workflows/seal-build.yml"
+          find "$RUNNER_TEMP/modsrc/.github" -depth -type d -empty -delete
+          cd "$RUNNER_TEMP/modzip"
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MODULE" "$VERSION" "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/out/$VERSION.zip"
+          unzip -l "$RUNNER_TEMP/out/$VERSION.zip" | tail -n 3
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: |
+          set -o pipefail
+          FILTER="${{ inputs.test-filter }}"
+          # -json keeps each test's own output (incl. t.Skip messages) attributable;
+          # jq renders it back to the usual `go test -v` text in the log.
+          RENDER='. as $l | (fromjson? // {Output: ($l + "\n")}) | .Output // empty'
+          if [ -n "$FILTER" ]; then
+            go test -json -v -count=1 -run "^($(echo "$FILTER" | tr ' ' '|'))$" ./... \
+              | tee "$RUNNER_TEMP/test.json" | jq -Rrj "$RENDER" | tee "$RUNNER_TEMP/test.log"
+            for t in $FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/test.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -json -v -count=1 ./... \
+              | tee "$RUNNER_TEMP/test.json" | jq -Rrj "$RENDER" | tee "$RUNNER_TEMP/test.log"
+          fi
+
+      - name: Test summary
+        if: always()
+        run: |
+          JSON="$RUNNER_TEMP/test.json"
+          touch "$JSON"
+          jq -R 'fromjson?' "$JSON" > "$RUNNER_TEMP/events.json"
+          echo "=== Skipped tests with reasons ==="
+          jq -rs '
+            [ .[] | select(.Test != null) ] | group_by(.Package + " " + .Test)[]
+            | select(any(.[]; .Action == "skip"))
+            | ([ .[] | select(.Action == "output") | .Output
+                 | select(test("^\\s*(=== |--- )|^\\s*$") | not)
+                 | sub("^\\s+"; "") | rtrimstr("\n") ] | join(" | ")) as $why
+            | "SKIP \(.[0].Package) \(.[0].Test): \(if $why == "" then "(skipped without a message)" else $why end)"
+          ' "$RUNNER_TEMP/events.json"
+          echo "=== Test summary ==="
+          jq -rs '
+            def every(a): [ .[] | select(.Test != null and .Action == a) ] | length;
+            def top(a): [ .[] | select(.Test != null and .Action == a and (.Test | contains("/") | not)) ] | length;
+            "Packages ok: \([ .[] | select(.Test == null and .Action == "pass") ] | length), packages FAIL: \([ .[] | select(.Test == null and .Action == "fail") ] | length)",
+            "Top-level tests passed: \(top("pass")), failed: \(top("fail")), skipped: \(top("skip"))",
+            "Tests+subtests passed: \(every("pass")), failed: \(every("fail")), skipped: \(every("skip"))"
+          ' "$RUNNER_TEMP/events.json"
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.go == '1.25.1'
+        with:
+          name: go-module-zip
+          path: ${{ runner.temp }}/out/*.zip
+          if-no-files-found: error
